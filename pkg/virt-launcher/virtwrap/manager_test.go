@@ -26,6 +26,8 @@ import (
 	"io/ioutil"
 	"os"
 	"os/user"
+	"strings"
+	"time"
 
 	"github.com/golang/mock/gomock"
 	libvirt "github.com/libvirt/libvirt-go"
@@ -39,6 +41,7 @@ import (
 	v1 "kubevirt.io/kubevirt/pkg/api/v1"
 	cloudinit "kubevirt.io/kubevirt/pkg/cloud-init"
 	"kubevirt.io/kubevirt/pkg/log"
+	cmdclient "kubevirt.io/kubevirt/pkg/virt-handler/cmd-client"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/api"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/cli"
 	"kubevirt.io/kubevirt/pkg/virt-launcher/virtwrap/network"
@@ -212,6 +215,8 @@ var _ = Describe("Manager", func() {
 	})
 	Context("test migration monitor", func() {
 		It("migration should be canceled if it's not progressing", func() {
+			migrationErrorChan := make(chan error)
+			defer close(migrationErrorChan)
 			// Make sure that we always free the domain after use
 			mockDomain.EXPECT().Free().AnyTimes()
 			fake_jobinfo := &libvirt.DomainJobInfo{
@@ -219,7 +224,8 @@ var _ = Describe("Manager", func() {
 				DataRemaining: 32479827394,
 			}
 
-			mConfig := &v1.MigrationConfig{
+			options := &cmdclient.MigrationOptions{
+				Bandwidth:               resource.MustParse("64Mi"),
 				ProgressTimeout:         2,
 				CompletionTimeoutPerGiB: 300,
 			}
@@ -227,7 +233,6 @@ var _ = Describe("Manager", func() {
 			vmi := newVMI(testNamespace, testVmName)
 			vmi.Status.MigrationState = &v1.VirtualMachineInstanceMigrationState{
 				MigrationUID: "111222333",
-				Config:       mConfig,
 			}
 
 			domainSpec := expectIsolationDetectionForVMI(vmi)
@@ -246,9 +251,11 @@ var _ = Describe("Manager", func() {
 			mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DOMAIN_XML_MIGRATABLE)).Return(string(xml), nil)
 			mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DOMAIN_XML_INACTIVE)).Return(string(xml), nil)
 
-			liveMigrationMonitor(vmi, mockDomain, manager)
+			liveMigrationMonitor(vmi, mockDomain, manager, options, migrationErrorChan)
 		})
 		It("migration should be canceled if timeout has been reached", func() {
+			migrationErrorChan := make(chan error)
+			defer close(migrationErrorChan)
 			// Make sure that we always free the domain after use
 			var migrationData = 32479827394
 			mockDomain.EXPECT().Free().AnyTimes()
@@ -260,14 +267,14 @@ var _ = Describe("Manager", func() {
 				}
 			}()
 
-			mConfig := &v1.MigrationConfig{
+			options := &cmdclient.MigrationOptions{
+				Bandwidth:               resource.MustParse("64Mi"),
 				ProgressTimeout:         3,
 				CompletionTimeoutPerGiB: 150,
 			}
 			vmi := newVMI(testNamespace, testVmName)
 			vmi.Status.MigrationState = &v1.VirtualMachineInstanceMigrationState{
 				MigrationUID: "111222333",
-				Config:       mConfig,
 			}
 
 			domainSpec := expectIsolationDetectionForVMI(vmi)
@@ -286,7 +293,63 @@ var _ = Describe("Manager", func() {
 			mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DOMAIN_XML_MIGRATABLE)).Return(string(xml), nil)
 			mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DOMAIN_XML_INACTIVE)).Return(string(xml), nil)
 
-			liveMigrationMonitor(vmi, mockDomain, manager)
+			liveMigrationMonitor(vmi, mockDomain, manager, options, migrationErrorChan)
+		})
+		It("migration should be canceled when requested", func() {
+			// Make sure that we always free the domain after use
+			mockDomain.EXPECT().Free().AnyTimes()
+			fake_jobinfo := func() *libvirt.DomainJobInfo {
+				return &libvirt.DomainJobInfo{
+					Type:          libvirt.DOMAIN_JOB_UNBOUNDED,
+					DataRemaining: uint64(32479827394),
+				}
+			}()
+
+			vmi := newVMI(testNamespace, testVmName)
+			vmi.Status.MigrationState = &v1.VirtualMachineInstanceMigrationState{
+				MigrationUID: "111222333",
+			}
+
+			domainSpec := expectIsolationDetectionForVMI(vmi)
+			xml, err := xml.Marshal(domainSpec)
+			Expect(err).To(BeNil())
+			mockDomain.EXPECT().GetState().AnyTimes().Return(libvirt.DOMAIN_RUNNING, 1, nil)
+			mockConn.EXPECT().LookupDomainByName(testDomainName).AnyTimes().Return(mockDomain, nil)
+			mockDomain.EXPECT().GetJobInfo().AnyTimes().Return(fake_jobinfo, nil)
+			mockDomain.EXPECT().AbortJob().MaxTimes(1)
+			mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DOMAIN_XML_MIGRATABLE)).AnyTimes().Return(string(xml), nil)
+			mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DOMAIN_XML_INACTIVE)).AnyTimes().Return(string(xml), nil)
+			manager, _ := NewLibvirtDomainManager(mockConn, "fake", nil, 0)
+			manager.CancelVMIMigration(vmi)
+
+		})
+		It("shouldn't be able to call cancel migration more than once", func() {
+			// Make sure that we always free the domain after use
+			mockDomain.EXPECT().Free().AnyTimes()
+
+			now := metav1.Time{Time: time.Unix(time.Now().UTC().Unix(), 0)}
+			vmi := newVMI(testNamespace, testVmName)
+			vmi.Status.MigrationState = &v1.VirtualMachineInstanceMigrationState{
+				MigrationUID:   "111222333",
+				StartTimestamp: &now,
+			}
+
+			domainSpec := expectIsolationDetectionForVMI(vmi)
+			domainSpec.Metadata.KubeVirt.Migration = &api.MigrationMetadata{
+
+				UID:         vmi.Status.MigrationState.MigrationUID,
+				AbortStatus: string(v1.MigrationAbortInProgress),
+			}
+
+			xml, err := xml.Marshal(domainSpec)
+			Expect(err).To(BeNil())
+			mockDomain.EXPECT().GetState().AnyTimes().Return(libvirt.DOMAIN_RUNNING, 1, nil)
+			mockConn.EXPECT().LookupDomainByName(testDomainName).AnyTimes().Return(mockDomain, nil)
+			mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DOMAIN_XML_MIGRATABLE)).AnyTimes().Return(string(xml), nil)
+			mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DOMAIN_XML_INACTIVE)).AnyTimes().Return(string(xml), nil)
+			manager, _ := NewLibvirtDomainManager(mockConn, "fake", nil, 0)
+			err = manager.CancelVMIMigration(vmi)
+			Expect(err).To(BeNil())
 		})
 
 	})
@@ -306,6 +369,65 @@ var _ = Describe("Manager", func() {
 			manager, _ := NewLibvirtDomainManager(mockConn, "fake", nil, 0)
 			err := manager.PrepareMigrationTarget(vmi, true)
 			Expect(err).To(BeNil())
+		})
+		It("should verify that migration failure is set in the monitor thread", func() {
+			isMigrationFailedSet := make(chan bool, 1)
+
+			defer close(isMigrationFailedSet)
+
+			// Make sure that we always free the domain after use
+			mockDomain.EXPECT().Free().AnyTimes()
+			fake_jobinfo := func() *libvirt.DomainJobInfo {
+				return &libvirt.DomainJobInfo{
+					Type:          libvirt.DOMAIN_JOB_NONE,
+					DataRemaining: uint64(32479827394),
+				}
+			}()
+
+			vmi := newVMI(testNamespace, testVmName)
+			vmi.Status.MigrationState = &v1.VirtualMachineInstanceMigrationState{
+				MigrationUID: "111222333",
+			}
+
+			userData := "fake\nuser\ndata\n"
+			networkData := "FakeNetwork"
+			addCloudInitDisk(vmi, userData, networkData)
+			domainSpec := expectIsolationDetectionForVMI(vmi)
+			domainSpec.Metadata.KubeVirt.Migration = &api.MigrationMetadata{}
+
+			manager, _ := NewLibvirtDomainManager(mockConn, "fake", nil, 0)
+
+			mockConn.EXPECT().LookupDomainByName(testDomainName).AnyTimes().Return(mockDomain, nil)
+			mockDomain.EXPECT().GetState().AnyTimes().Return(libvirt.DOMAIN_RUNNING, 1, nil)
+
+			xml, err := xml.Marshal(domainSpec)
+			Expect(err).To(BeNil())
+			mockDomain.EXPECT().GetJobInfo().AnyTimes().Return(fake_jobinfo, nil)
+			gomock.InOrder(
+				mockConn.EXPECT().DomainDefineXML(gomock.Any()).Return(mockDomain, nil),
+				mockConn.EXPECT().DomainDefineXML(gomock.Any()).DoAndReturn(func(xml string) (cli.VirDomain, error) {
+					Expect(strings.Contains(xml, "MigrationFailed")).To(BeTrue())
+					isMigrationFailedSet <- true
+					return mockDomain, nil
+				}),
+			)
+			mockDomain.EXPECT().GetXMLDesc(gomock.Any()).AnyTimes().Return(string(xml), nil)
+			mockDomain.EXPECT().MigrateToURI3(gomock.Any(), gomock.Any(), gomock.Any()).Return(fmt.Errorf("MigrationFailed"))
+			options := &cmdclient.MigrationOptions{
+				Bandwidth:               resource.MustParse("64Mi"),
+				ProgressTimeout:         150,
+				CompletionTimeoutPerGiB: 300,
+			}
+			err = manager.MigrateVMI(vmi, options)
+			Expect(err).To(BeNil())
+			Eventually(func() bool {
+				select {
+				case isSet := <-isMigrationFailedSet:
+					return isSet
+				default:
+				}
+				return false
+			}, 20*time.Second, 2).Should(BeTrue(), "failed migration result wasn't set")
 		})
 
 		It("should detect inprogress migration job", func() {
@@ -333,8 +455,12 @@ var _ = Describe("Manager", func() {
 
 			mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DOMAIN_XML_MIGRATABLE)).Return(string(xml), nil)
 			mockDomain.EXPECT().GetXMLDesc(gomock.Eq(libvirt.DOMAIN_XML_INACTIVE)).Return(string(xml), nil)
-
-			err = manager.MigrateVMI(vmi)
+			options := &cmdclient.MigrationOptions{
+				Bandwidth:               resource.MustParse("64Mi"),
+				ProgressTimeout:         150,
+				CompletionTimeoutPerGiB: 300,
+			}
+			err = manager.MigrateVMI(vmi, options)
 			Expect(err).To(BeNil())
 		})
 		It("should correctly collect a list of disks for migration", func() {
@@ -422,7 +548,7 @@ var _ = Describe("Manager", func() {
 				// Make sure that we always free the domain after use
 				mockDomain.EXPECT().Free()
 				mockConn.EXPECT().LookupDomainByName(testDomainName).Return(mockDomain, nil)
-				mockDomain.EXPECT().Undefine().Return(nil)
+				mockDomain.EXPECT().UndefineFlags(libvirt.DOMAIN_UNDEFINE_NVRAM).Return(nil)
 				manager, _ := NewLibvirtDomainManager(mockConn, "fake", nil, 0)
 				err := manager.DeleteVMI(newVMI(testNamespace, testVmName))
 				Expect(err).To(BeNil())
@@ -447,17 +573,22 @@ var _ = Describe("Manager", func() {
 		)
 	})
 	table.DescribeTable("check migration flags",
-		func(isBlockMigration bool) {
-			flags := prepateMigrationFlags(isBlockMigration)
+		func(migrationType string) {
+			isBlockMigration := migrationType == "block"
+			isUnsafeMigration := migrationType == "unsafe"
+			flags := prepareMigrationFlags(isBlockMigration, isUnsafeMigration)
 			expectedMigrateFlags := libvirt.MIGRATE_LIVE | libvirt.MIGRATE_PEER2PEER
 
 			if isBlockMigration {
 				expectedMigrateFlags |= libvirt.MIGRATE_NON_SHARED_INC
+			} else if migrationType == "unsafe" {
+				expectedMigrateFlags |= libvirt.MIGRATE_UNSAFE
 			}
 			Expect(flags).To(Equal(expectedMigrateFlags))
 		},
-		table.Entry("with block migration", true),
-		table.Entry("without block migration", false),
+		table.Entry("with block migration", "block"),
+		table.Entry("without block migration", "live"),
+		table.Entry("unsafe migration", "unsafe"),
 	)
 
 	table.DescribeTable("on successful list all domains",

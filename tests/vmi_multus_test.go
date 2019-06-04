@@ -22,10 +22,12 @@ package tests_test
 import (
 	"flag"
 	"fmt"
+	"strings"
 	"time"
 
 	expect "github.com/google/goexpect"
 	. "github.com/onsi/ginkgo"
+	"github.com/onsi/ginkgo/extensions/table"
 	. "github.com/onsi/gomega"
 	k8sv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -39,10 +41,11 @@ import (
 )
 
 const (
-	postUrl      = "/apis/k8s.cni.cncf.io/v1/namespaces/%s/network-attachment-definitions/%s"
-	ovsConfCRD   = `{"apiVersion":"k8s.cni.cncf.io/v1","kind":"NetworkAttachmentDefinition","metadata":{"name":"%s","namespace":"%s"},"spec":{"config":"{ \"cniVersion\": \"0.3.1\", \"type\": \"ovs\", \"bridge\": \"br1\", \"vlan\": 100 }"}}`
-	ptpConfCRD   = `{"apiVersion":"k8s.cni.cncf.io/v1","kind":"NetworkAttachmentDefinition","metadata":{"name":"%s","namespace":"%s"},"spec":{"config":"{ \"name\": \"mynet\", \"type\": \"ptp\", \"ipam\": { \"type\": \"host-local\", \"subnet\": \"10.1.1.0/24\" } }"}}`
-	sriovConfCRD = `{"apiVersion":"k8s.cni.cncf.io/v1","kind":"NetworkAttachmentDefinition","metadata":{"name":"%s","namespace":"%s","annotations":{"k8s.v1.cni.cncf.io/resourceName":"intel.com/sriov"}},"spec":{"config":"{ \"name\": \"sriov\", \"type\": \"sriov\", \"ipam\": { \"type\": \"host-local\", \"subnet\": \"10.1.1.0/24\" } }"}}`
+	postUrl              = "/apis/k8s.cni.cncf.io/v1/namespaces/%s/network-attachment-definitions/%s"
+	ovsConfCRD           = `{"apiVersion":"k8s.cni.cncf.io/v1","kind":"NetworkAttachmentDefinition","metadata":{"name":"%s","namespace":"%s"},"spec":{"config":"{ \"cniVersion\": \"0.3.1\", \"type\": \"ovs\", \"bridge\": \"br1\", \"vlan\": 100 }"}}`
+	ptpConfCRD           = `{"apiVersion":"k8s.cni.cncf.io/v1","kind":"NetworkAttachmentDefinition","metadata":{"name":"%s","namespace":"%s"},"spec":{"config":"{ \"name\": \"mynet\", \"type\": \"ptp\", \"ipam\": { \"type\": \"host-local\", \"subnet\": \"10.1.1.0/24\" } }"}}`
+	ptpConfWithTuningCRD = `{"apiVersion":"k8s.cni.cncf.io/v1","kind":"NetworkAttachmentDefinition","metadata":{"name":"%s","namespace":"%s"},"spec":{"config":"{ \"cniVersion\": \"0.3.1\", \"name\": \"mynet\", \"plugins\": [{\"type\": \"ptp\", \"ipam\": { \"type\": \"host-local\", \"subnet\": \"10.1.1.0/24\" }},{\"type\": \"tuning\"}]}"}}`
+	sriovConfCRD         = `{"apiVersion":"k8s.cni.cncf.io/v1","kind":"NetworkAttachmentDefinition","metadata":{"name":"%s","namespace":"%s","annotations":{"k8s.v1.cni.cncf.io/resourceName":"intel.com/sriov"}},"spec":{"config":"{ \"name\": \"sriov\", \"type\": \"sriov\", \"ipam\": { \"type\": \"host-local\", \"subnet\": \"10.1.1.0/24\" } }"}}`
 )
 
 var _ = Describe("Multus", func() {
@@ -52,9 +55,6 @@ var _ = Describe("Multus", func() {
 	virtClient, err := kubecli.GetKubevirtClient()
 	tests.PanicOnError(err)
 
-	var detachedVMI *v1.VirtualMachineInstance
-	var vmiOne *v1.VirtualMachineInstance
-	var vmiTwo *v1.VirtualMachineInstance
 	var nodes *k8sv1.NodeList
 
 	defaultInterface := v1.Interface{
@@ -81,11 +81,24 @@ var _ = Describe("Multus", func() {
 	ovsNetwork := v1.Network{
 		Name: "ovs",
 		NetworkSource: v1.NetworkSource{
-			Multus: &v1.CniNetwork{
+			Multus: &v1.MultusNetwork{
 				NetworkName: "ovs-net-vlan100",
 			},
 		},
 	}
+
+	AfterEach(func() {
+		// Multus tests need to ensure that old VMIs are gone
+		Expect(virtClient.RestClient().Delete().Namespace(tests.NamespaceTestDefault).Resource("virtualmachineinstances").Do().Error()).To(Succeed())
+		Expect(virtClient.RestClient().Delete().Namespace(tests.NamespaceTestAlternative).Resource("virtualmachineinstances").Do().Error()).To(Succeed())
+		Eventually(func() int {
+			list1, err := virtClient.VirtualMachineInstance(tests.NamespaceTestDefault).List(&v13.ListOptions{})
+			Expect(err).ToNot(HaveOccurred())
+			list2, err := virtClient.VirtualMachineInstance(tests.NamespaceTestAlternative).List(&v13.ListOptions{})
+			Expect(err).ToNot(HaveOccurred())
+			return len(list1.Items) + len(list2.Items)
+		}, 180*time.Second, 1*time.Second).Should(BeZero())
+	})
 
 	createVMIOnNode := func(interfaces []v1.Interface, networks []v1.Network) *v1.VirtualMachineInstance {
 		vmi := tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskAlpine), "#!/bin/bash\n")
@@ -127,6 +140,14 @@ var _ = Describe("Multus", func() {
 			Do()
 		Expect(result.Error()).NotTo(HaveOccurred())
 
+		// Create ptp crd with tuning plugin enabled
+		result = virtClient.RestClient().
+			Post().
+			RequestURI(fmt.Sprintf(postUrl, tests.NamespaceTestDefault, "ptp-conf-tuning")).
+			Body([]byte(fmt.Sprintf(ptpConfWithTuningCRD, "ptp-conf-tuning", tests.NamespaceTestDefault))).
+			Do()
+		Expect(result.Error()).NotTo(HaveOccurred())
+
 		// Create two sriov networks referring to the same resource name
 		result = virtClient.RestClient().
 			Post().
@@ -142,24 +163,16 @@ var _ = Describe("Multus", func() {
 		Expect(result.Error()).NotTo(HaveOccurred())
 	})
 
-	Describe("[rfe_id:694][crit:medium][vendor:cnv-qe@redhat.com][level:component]VirtualMachineInstance uisng different types of interfaces.", func() {
+	Describe("[rfe_id:694][crit:medium][vendor:cnv-qe@redhat.com][level:component]VirtualMachineInstance using different types of interfaces.", func() {
 		Context("VirtualMachineInstance with cni ptp plugin interface", func() {
-			AfterEach(func() {
-				virtClient.VirtualMachineInstance(tests.NamespaceTestDefault).Delete(detachedVMI.Name, &v13.DeleteOptions{})
-				fmt.Printf("Waiting for vmi %s in %s namespace to be removed, this can take a while ...\n", detachedVMI.Name, tests.NamespaceTestDefault)
-				EventuallyWithOffset(1, func() bool {
-					return errors.IsNotFound(virtClient.VirtualMachineInstance(tests.NamespaceTestDefault).Delete(detachedVMI.Name, nil))
-				}, 180*time.Second, 1*time.Second).
-					Should(BeTrue())
-			})
 
 			It("[test_id:1751]should create a virtual machine with one interface", func() {
 				By("checking virtual machine instance can ping 10.1.1.1 using ptp cni plugin")
-				detachedVMI = tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskCirros), "#!/bin/bash\necho 'hello'\n")
+				detachedVMI := tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskCirros), "#!/bin/bash\necho 'hello'\n")
 				detachedVMI.Spec.Domain.Devices.Interfaces = []v1.Interface{{Name: "ptp", InterfaceBindingMethod: v1.InterfaceBindingMethod{Bridge: &v1.InterfaceBridge{}}}}
 				detachedVMI.Spec.Networks = []v1.Network{
 					{Name: "ptp", NetworkSource: v1.NetworkSource{
-						Multus: &v1.CniNetwork{NetworkName: "ptp-conf"},
+						Multus: &v1.MultusNetwork{NetworkName: "ptp-conf"},
 					}},
 				}
 
@@ -172,11 +185,11 @@ var _ = Describe("Multus", func() {
 
 			It("[test_id:1752]should create a virtual machine with one interface with network definition from different namespace", func() {
 				By("checking virtual machine instance can ping 10.1.1.1 using ptp cni plugin")
-				detachedVMI = tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskCirros), "#!/bin/bash\necho 'hello'\n")
+				detachedVMI := tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskCirros), "#!/bin/bash\necho 'hello'\n")
 				detachedVMI.Spec.Domain.Devices.Interfaces = []v1.Interface{{Name: "ptp", InterfaceBindingMethod: v1.InterfaceBindingMethod{Bridge: &v1.InterfaceBridge{}}}}
 				detachedVMI.Spec.Networks = []v1.Network{
 					{Name: "ptp", NetworkSource: v1.NetworkSource{
-						Multus: &v1.CniNetwork{NetworkName: fmt.Sprintf("%s/%s", tests.NamespaceTestAlternative, "ptp-conf-2")},
+						Multus: &v1.MultusNetwork{NetworkName: fmt.Sprintf("%s/%s", tests.NamespaceTestAlternative, "ptp-conf-2")},
 					}},
 				}
 
@@ -189,7 +202,7 @@ var _ = Describe("Multus", func() {
 
 			It("[test_id:1753]should create a virtual machine with two interfaces", func() {
 				By("checking virtual machine instance can ping 10.1.1.1 using ptp cni plugin")
-				detachedVMI = tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskCirros), "#!/bin/bash\necho 'hello'\n")
+				detachedVMI := tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskCirros), "#!/bin/bash\necho 'hello'\n")
 
 				detachedVMI.Spec.Domain.Devices.Interfaces = []v1.Interface{
 					defaultInterface,
@@ -197,7 +210,7 @@ var _ = Describe("Multus", func() {
 				detachedVMI.Spec.Networks = []v1.Network{
 					defaultNetwork,
 					{Name: "ptp", NetworkSource: v1.NetworkSource{
-						Multus: &v1.CniNetwork{NetworkName: "ptp-conf"},
+						Multus: &v1.MultusNetwork{NetworkName: "ptp-conf"},
 					}},
 				}
 
@@ -224,22 +237,110 @@ var _ = Describe("Multus", func() {
 			})
 		})
 
+		Context("VirtualMachineInstance with multus network as default network", func() {
+
+			It("should create a virtual machine with one interface with multus default network definition", func() {
+				detachedVMI := tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskCirros), "#!/bin/bash\necho 'hello'\n")
+				detachedVMI.Spec.Domain.Devices.Interfaces = []v1.Interface{{Name: "ptp", InterfaceBindingMethod: v1.InterfaceBindingMethod{Bridge: &v1.InterfaceBridge{}}}}
+				detachedVMI.Spec.Networks = []v1.Network{
+					{Name: "ptp", NetworkSource: v1.NetworkSource{
+						Multus: &v1.MultusNetwork{
+							NetworkName: fmt.Sprintf("%s/%s", tests.NamespaceTestDefault, "ptp-conf"),
+							Default:     true,
+						}}},
+				}
+
+				_, err = virtClient.VirtualMachineInstance(tests.NamespaceTestDefault).Create(detachedVMI)
+				Expect(err).ToNot(HaveOccurred())
+				tests.WaitUntilVMIReady(detachedVMI, tests.LoggedInCirrosExpecter)
+
+				By("checking virtual machine instance can ping 10.1.1.1 using ptp cni plugin")
+				pingVirtualMachine(detachedVMI, "10.1.1.1", "\\$ ")
+
+				By("checking virtual machine instance only has one interface")
+				// lo0, eth0
+				err = tests.CheckForTextExpecter(detachedVMI, []expect.Batcher{
+					&expect.BSnd{S: "\n"},
+					&expect.BExp{R: "\\$ "},
+					&expect.BSnd{S: "ip link show | grep -c UP\n"},
+					&expect.BExp{R: "2"},
+				}, 15)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("checking pod has only one interface")
+				// lo0, eth0, k6t-eth0, vnet0
+				output := tests.RunCommandOnVmiPod(detachedVMI, []string{"/bin/bash", "-c", "/usr/sbin/ip link show|grep -c UP"})
+				ExpectWithOffset(1, strings.TrimSpace(output)).To(Equal("4"))
+			})
+		})
+
+		Context("VirtualMachineInstance with cni ptp plugin interface with custom MAC address", func() {
+
+			table.DescribeTable("configure valid custom MAC address on ptp interface", func(networkName string) {
+				customMacAddress := "50:00:00:00:90:0d"
+				ptpInterface := v1.Interface{
+					Name: "ptp",
+					InterfaceBindingMethod: v1.InterfaceBindingMethod{
+						Bridge: &v1.InterfaceBridge{},
+					},
+				}
+				ptpNetwork := v1.Network{
+					Name: "ptp",
+					NetworkSource: v1.NetworkSource{
+						Multus: &v1.MultusNetwork{
+							NetworkName: networkName,
+						},
+					},
+				}
+
+				interfaces := []v1.Interface{ptpInterface}
+				networks := []v1.Network{ptpNetwork}
+
+				By("Creating a VM with custom MAC address on its ptp interface.")
+				interfaces[0].MacAddress = customMacAddress
+				vmiOne := createVMIOnNode(interfaces, networks)
+				tests.WaitUntilVMIReady(vmiOne, tests.LoggedInAlpineExpecter)
+
+				By("Configuring static IP address to ptp interface.")
+				configInterface(vmiOne, "eth0", "10.1.1.1/24", "localhost:~#")
+
+				By("Verifying the desired custom MAC is the one that was actually configured on the interface.")
+				ipLinkShow := fmt.Sprintf("ip link show eth0 | grep -i \"%s\" | wc -l\n", customMacAddress)
+				err = tests.CheckForTextExpecter(vmiOne, []expect.Batcher{
+					&expect.BSnd{S: ipLinkShow},
+					&expect.BExp{R: "1"},
+				}, 15)
+				Expect(err).ToNot(HaveOccurred())
+
+				By("Verifying the desired custom MAC is not configured inside the pod namespace.")
+				vmiPod := tests.GetRunningPodByVirtualMachineInstance(vmiOne, tests.NamespaceTestDefault)
+				out, err := tests.ExecuteCommandOnPod(
+					virtClient,
+					vmiPod,
+					"compute",
+					[]string{"sh", "-c", "ip a"},
+				)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(strings.Contains(out, customMacAddress)).To(BeFalse())
+			},
+				table.Entry("when not using tuning plugin", "ptp-conf"),
+				table.Entry("when using tuning plugin", "ptp-conf-tuning"),
+			)
+		})
+
 		Context("VirtualMachineInstance with sriov plugin interface", func() {
 			BeforeEach(func() {
 				tests.SkipIfNoSriovDevicePlugin(virtClient)
-			})
-			AfterEach(func() {
-				deleteVMIs(virtClient, []*v1.VirtualMachineInstance{vmiOne})
 			})
 
 			It("[test_id:1754]should create a virtual machine with sriov interface", func() {
 				// since neither cirros nor alpine has drivers for Intel NICs, we are left with fedora
 				userData := "#cloud-config\npassword: fedora\nchpasswd: { expire: False }\n"
-				vmiOne = tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskFedora), userData)
+				vmiOne := tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskFedora), userData)
 				tests.AddExplicitPodNetworkInterface(vmiOne)
 
 				iface := v1.Interface{Name: "sriov", InterfaceBindingMethod: v1.InterfaceBindingMethod{SRIOV: &v1.InterfaceSRIOV{}}}
-				network := v1.Network{Name: "sriov", NetworkSource: v1.NetworkSource{Multus: &v1.CniNetwork{NetworkName: "sriov"}}}
+				network := v1.Network{Name: "sriov", NetworkSource: v1.NetworkSource{Multus: &v1.MultusNetwork{NetworkName: "sriov"}}}
 				vmiOne.Spec.Domain.Devices.Interfaces = append(vmiOne.Spec.Domain.Devices.Interfaces, iface)
 				vmiOne.Spec.Networks = append(vmiOne.Spec.Networks, network)
 
@@ -291,12 +392,12 @@ var _ = Describe("Multus", func() {
 			It("[test_id:1755]should create a virtual machine with two sriov interfaces referring the same resource", func() {
 				// since neither cirros nor alpine has drivers for Intel NICs, we are left with fedora
 				userData := "#cloud-config\npassword: fedora\nchpasswd: { expire: False }\n"
-				vmiOne = tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskFedora), userData)
+				vmiOne := tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskFedora), userData)
 				tests.AddExplicitPodNetworkInterface(vmiOne)
 
 				for _, name := range []string{"sriov", "sriov2"} {
 					iface := v1.Interface{Name: name, InterfaceBindingMethod: v1.InterfaceBindingMethod{SRIOV: &v1.InterfaceSRIOV{}}}
-					network := v1.Network{Name: name, NetworkSource: v1.NetworkSource{Multus: &v1.CniNetwork{NetworkName: name}}}
+					network := v1.Network{Name: name, NetworkSource: v1.NetworkSource{Multus: &v1.MultusNetwork{NetworkName: name}}}
 					vmiOne.Spec.Domain.Devices.Interfaces = append(vmiOne.Spec.Domain.Devices.Interfaces, iface)
 					vmiOne.Spec.Networks = append(vmiOne.Spec.Networks, network)
 				}
@@ -351,17 +452,14 @@ var _ = Describe("Multus", func() {
 		})
 
 		Context("VirtualMachineInstance with ovs-cni plugin interface", func() {
-			AfterEach(func() {
-				deleteVMIs(virtClient, []*v1.VirtualMachineInstance{vmiOne, vmiTwo})
-			})
 
 			It("[test_id:1577]should create two virtual machines with one interface", func() {
 				By("checking virtual machine instance can ping the secondary virtual machine instance using ovs-cni plugin")
 				interfaces := []v1.Interface{ovsInterface}
 				networks := []v1.Network{ovsNetwork}
 
-				vmiOne = createVMIOnNode(interfaces, networks)
-				vmiTwo = createVMIOnNode(interfaces, networks)
+				vmiOne := createVMIOnNode(interfaces, networks)
+				vmiTwo := createVMIOnNode(interfaces, networks)
 
 				tests.WaitUntilVMIReady(vmiOne, tests.LoggedInAlpineExpecter)
 				tests.WaitUntilVMIReady(vmiTwo, tests.LoggedInAlpineExpecter)
@@ -389,8 +487,8 @@ var _ = Describe("Multus", func() {
 					ovsNetwork,
 				}
 
-				vmiOne = createVMIOnNode(interfaces, networks)
-				vmiTwo = createVMIOnNode(interfaces, networks)
+				vmiOne := createVMIOnNode(interfaces, networks)
+				vmiTwo := createVMIOnNode(interfaces, networks)
 
 				tests.WaitUntilVMIReady(vmiOne, tests.LoggedInAlpineExpecter)
 				tests.WaitUntilVMIReady(vmiTwo, tests.LoggedInAlpineExpecter)
@@ -414,18 +512,14 @@ var _ = Describe("Multus", func() {
 			ovsIfIdx := 0
 			customMacAddress := "50:00:00:00:90:0d"
 
-			AfterEach(func() {
-				deleteVMIs(virtClient, []*v1.VirtualMachineInstance{vmiOne, vmiTwo})
-			})
-
 			It("[test_id:676]should configure valid custom MAC address on ovs-cni interface.", func() {
 				By("Creating a VM with ovs-cni network interface and default MAC address.")
-				vmiTwo = createVMIOnNode(interfaces, networks)
+				vmiTwo := createVMIOnNode(interfaces, networks)
 				tests.WaitUntilVMIReady(vmiTwo, tests.LoggedInAlpineExpecter)
 
 				By("Creating another VM with custom MAC address on its ovs-cni interface.")
 				interfaces[ovsIfIdx].MacAddress = customMacAddress
-				vmiOne = createVMIOnNode(interfaces, networks)
+				vmiOne := createVMIOnNode(interfaces, networks)
 				tests.WaitUntilVMIReady(vmiOne, tests.LoggedInAlpineExpecter)
 
 				By("Configuring static IP address to the ovs interface.")
@@ -440,14 +534,22 @@ var _ = Describe("Multus", func() {
 				}, 15)
 				Expect(err).ToNot(HaveOccurred())
 
+				By("Verifying the desired custom MAC is not configured inside the pod namespace.")
+				vmiPod := tests.GetRunningPodByVirtualMachineInstance(vmiOne, tests.NamespaceTestDefault)
+				out, err := tests.ExecuteCommandOnPod(
+					virtClient,
+					vmiPod,
+					"compute",
+					[]string{"sh", "-c", "ip a"},
+				)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(strings.Contains(out, customMacAddress)).To(BeFalse())
+
 				By("Ping from the VM with the custom MAC to the other VM.")
 				pingVirtualMachine(vmiOne, "10.1.1.2", "localhost:~#")
 			})
 		})
 		Context("Single VirtualMachineInstance with ovs-cni plugin interface", func() {
-			AfterEach(func() {
-				deleteVMIs(virtClient, []*v1.VirtualMachineInstance{vmiOne})
-			})
 
 			It("[test_id:1756]should report all interfaces in Status", func() {
 				interfaces := []v1.Interface{
@@ -459,7 +561,7 @@ var _ = Describe("Multus", func() {
 					ovsNetwork,
 				}
 
-				vmiOne = createVMIOnNode(interfaces, networks)
+				vmiOne := createVMIOnNode(interfaces, networks)
 
 				tests.WaitUntilVMIReady(vmiOne, tests.LoggedInAlpineExpecter)
 
@@ -521,11 +623,6 @@ var _ = Describe("Multus", func() {
 
 	Describe("[rfe_id:1758][crit:medium][vendor:cnv-qe@redhat.com][level:component]VirtualMachineInstance definition", func() {
 		Context("with quemu guest agent", func() {
-			var agentVMI *v1.VirtualMachineInstance
-
-			AfterEach(func() {
-				deleteVMIs(virtClient, []*v1.VirtualMachineInstance{agentVMI})
-			})
 
 			It("[test_id:1757] should report guest interfaces in VMI status", func() {
 				interfaces := []v1.Interface{
@@ -541,16 +638,20 @@ var _ = Describe("Multus", func() {
 				ep2Ip := "1.0.0.11/24"
 				ep1IpV6 := "fe80::ce3d:82ff:fe52:24c0/64"
 				ep2IpV6 := "fe80::ce3d:82ff:fe52:24c1/64"
-				agentVMI = tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskFedora), fmt.Sprintf(`#!/bin/bash
-	                echo "fedora" |passwd fedora --stdin
-	                ip link add ep1 type veth peer name ep2
-	                ip addr add %s dev ep1
+				userdata := fmt.Sprintf(`#!/bin/bash
+                    echo "fedora" |passwd fedora --stdin
+                    setenforce 0
+                    ip link add ep1 type veth peer name ep2
+                    ip addr add %s dev ep1
 	                ip addr add %s dev ep2
 	                ip addr add %s dev ep1
 	                ip addr add %s dev ep2
-					yum install -y qemu-guest-agent
-					systemctl start  qemu-guest-agent
-	                `, ep1Ip, ep2Ip, ep1IpV6, ep2IpV6))
+                    mkdir -p /usr/local/bin
+                    curl %s > /usr/local/bin/qemu-ga
+                    chmod +x /usr/local/bin/qemu-ga
+                    systemd-run --unit=guestagent /usr/local/bin/qemu-ga
+                `, ep1Ip, ep2Ip, ep1IpV6, ep2IpV6, tests.GuestAgentHttpUrl)
+				agentVMI := tests.NewRandomVMIWithEphemeralDiskAndUserdata(tests.ContainerDiskFor(tests.ContainerDiskFedora), userdata)
 
 				agentVMI.Spec.Domain.Devices.Interfaces = interfaces
 				agentVMI.Spec.Networks = networks
@@ -608,17 +709,6 @@ var _ = Describe("Multus", func() {
 		})
 	})
 })
-
-func deleteVMIs(virtClient kubecli.KubevirtClient, vmis []*v1.VirtualMachineInstance) {
-	for _, deleteVMI := range vmis {
-		virtClient.VirtualMachineInstance("default").Delete(deleteVMI.Name, &v13.DeleteOptions{})
-		fmt.Printf("Waiting for vmi %s in %s namespace to be removed, this can take a while ...\n", deleteVMI.Name, tests.NamespaceTestDefault)
-		EventuallyWithOffset(1, func() bool {
-			return errors.IsNotFound(virtClient.VirtualMachineInstance(tests.NamespaceTestDefault).Delete(deleteVMI.Name, nil))
-		}, 180*time.Second, 1*time.Second).
-			Should(BeTrue())
-	}
-}
 
 func configInterface(vmi *v1.VirtualMachineInstance, interfaceName, interfaceAddress, prompt string) {
 	cmdCheck := fmt.Sprintf("ip addr add %s dev %s\n", interfaceAddress, interfaceName)

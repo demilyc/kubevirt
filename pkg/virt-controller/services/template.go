@@ -40,7 +40,6 @@ import (
 	"kubevirt.io/kubevirt/pkg/kubecli"
 	"kubevirt.io/kubevirt/pkg/log"
 	"kubevirt.io/kubevirt/pkg/precond"
-	"kubevirt.io/kubevirt/pkg/util"
 	"kubevirt.io/kubevirt/pkg/util/hardware"
 	"kubevirt.io/kubevirt/pkg/util/net/dns"
 	"kubevirt.io/kubevirt/pkg/util/types"
@@ -48,10 +47,6 @@ import (
 )
 
 const configMapName = "kubevirt-config"
-const UseEmulationKey = "debug.useEmulation"
-const ImagePullPolicyKey = "dev.imagePullPolicy"
-const LessPVCSpaceTolerationKey = "pvc-tolerate-less-space-up-to-percent"
-const NodeSelectorsKey = "node-selectors"
 const KvmDevice = "devices.kubevirt.io/kvm"
 const TunDevice = "devices.kubevirt.io/tun"
 const VhostNetDevice = "devices.kubevirt.io/vhost-net"
@@ -70,8 +65,10 @@ const LibvirtStartupDelay = 10
 //to match a VirtualMachineInstance CPU model(Family) and/or features to nodes that support them.
 const NFD_CPU_MODEL_PREFIX = "feature.node.kubernetes.io/cpu-model-"
 const NFD_CPU_FEATURE_PREFIX = "feature.node.kubernetes.io/cpu-feature-"
+const NFD_KVM_INFO_PREFIX = "feature.node.kubernetes.io/kvm-info-cap-hyperv-"
 
 const MULTUS_RESOURCE_NAME_ANNOTATION = "k8s.v1.cni.cncf.io/resourceName"
+const MULTUS_DEFAULT_NETWORK_CNI_ANNOTATION = "v1.multus-cni.io/default-network"
 
 // Istio list of virtual interfaces whose inbound traffic (from VM) will be treated as outbound traffic in envoy
 const ISTIO_KUBEVIRT_ANNOTATION = "traffic.sidecar.istio.io/kubevirtInterfaces"
@@ -85,87 +82,12 @@ type templateService struct {
 	virtShareDir               string
 	ephemeralDiskDir           string
 	imagePullSecret            string
-	configMapStore             cache.Store
 	persistentVolumeClaimStore cache.Store
 	virtClient                 kubecli.KubevirtClient
+	clusterConfig              *virtconfig.ClusterConfig
 }
 
 type PvcNotFoundError error
-
-func getConfigMapEntry(store cache.Store, key string) (string, error) {
-
-	namespace, err := util.GetNamespace()
-	if err != nil {
-		return "", err
-	}
-
-	if obj, exists, err := store.GetByKey(namespace + "/" + configMapName); err != nil {
-		return "", err
-	} else if !exists {
-		return "", nil
-	} else {
-		return obj.(*k8sv1.ConfigMap).Data[key], nil
-	}
-}
-
-func IsEmulationAllowed(store cache.Store) (useEmulation bool, err error) {
-	var value string
-	value, err = getConfigMapEntry(store, UseEmulationKey)
-	if strings.ToLower(value) == "true" {
-		useEmulation = true
-	}
-	return
-}
-
-func GetImagePullPolicy(store cache.Store) (policy k8sv1.PullPolicy, err error) {
-	var value string
-	if value, err = getConfigMapEntry(store, ImagePullPolicyKey); err != nil || value == "" {
-		policy = k8sv1.PullIfNotPresent // Default if not specified
-	} else {
-		switch value {
-		case "Always":
-			policy = k8sv1.PullAlways
-		case "Never":
-			policy = k8sv1.PullNever
-		case "IfNotPresent":
-			policy = k8sv1.PullIfNotPresent
-		default:
-			err = fmt.Errorf("Invalid ImagePullPolicy in ConfigMap: %s", value)
-		}
-	}
-	return
-}
-
-func GetlessPVCSpaceToleration(store cache.Store) (toleration int, err error) {
-	var value string
-	if value, err = getConfigMapEntry(store, LessPVCSpaceTolerationKey); err != nil || value == "" {
-		toleration = 10 // Default if not specified
-	} else {
-		toleration, err = strconv.Atoi(value)
-		if err != nil || toleration < 0 || toleration > 100 {
-			err = fmt.Errorf("Invalid lessPVCSpaceToleration in ConfigMap: %s", value)
-			return
-		}
-	}
-	return
-}
-
-func getNodeSelectors(store cache.Store) (nodeSelectors map[string]string, err error) {
-	var value string
-	nodeSelectors = make(map[string]string)
-
-	if value, err = getConfigMapEntry(store, NodeSelectorsKey); err != nil || value == "" {
-		return
-	}
-	for _, s := range strings.Split(strings.TrimSpace(value), "\n") {
-		v := strings.Split(s, "=")
-		if len(v) != 2 {
-			return nil, fmt.Errorf("Invalid node selector: %s", s)
-		}
-		nodeSelectors[v[0]] = v[1]
-	}
-	return
-}
 
 func isSRIOVVmi(vmi *v1.VirtualMachineInstance) bool {
 	for _, iface := range vmi.Spec.Domain.Devices.Interfaces {
@@ -176,13 +98,87 @@ func isSRIOVVmi(vmi *v1.VirtualMachineInstance) bool {
 	return false
 }
 
-func IsCPUNodeDiscoveryEnabled(store cache.Store) bool {
-	if value, err := getConfigMapEntry(store, virtconfig.FeatureGatesKey); err != nil {
-		return false
-	} else if strings.Contains(value, virtconfig.CPUNodeDiscoveryGate) {
-		return true
+func isFeatureStateEnabled(fs *v1.FeatureState) bool {
+	return fs != nil && fs.Enabled != nil && *fs.Enabled
+}
+
+type hvFeatureLabel struct {
+	Feature *v1.FeatureState
+	Label   string
+}
+
+// makeHVFeatureLabelTable creates the mapping table between the VMI hyperv state and the label names.
+// The table needs pointers to v1.FeatureHyperv struct, so it has to be generated and can't be a
+// static var
+func makeHVFeatureLabelTable(vmi *v1.VirtualMachineInstance) []hvFeatureLabel {
+	// The following HyperV features don't require support from the host kernel, according to inspection
+	// of the QEMU sources (4.0 - adb3321bfd)
+	// VAPIC, Relaxed, Spinlocks, VendorID
+	// VPIndex, SyNIC: depend on both MSR and capability
+	// IPI, TLBFlush: depend on KVM Capabilities
+	// Runtime, Reset, SyNICTimer, Frequencies, Reenlightenment: depend on KVM MSRs availability
+	// EVMCS: depends on KVM capability, but the only way to know that is enable it, QEMU doesn't do
+	// any check before that, so we leave it out
+	//
+	// see also https://schd.ws/hosted_files/devconfcz2019/cf/vkuznets_enlightening_kvm_devconf2019.pdf
+	// to learn about dependencies between enlightenments
+
+	hyperv := vmi.Spec.Domain.Features.Hyperv // shortcut
+	return []hvFeatureLabel{
+		hvFeatureLabel{
+			Feature: hyperv.VPIndex,
+			Label:   "vpindex",
+		},
+		hvFeatureLabel{
+			Feature: hyperv.Runtime,
+			Label:   "runtime",
+		},
+		hvFeatureLabel{
+			Feature: hyperv.Reset,
+			Label:   "reset",
+		},
+		hvFeatureLabel{
+			// TODO: SyNIC depends on vp-index on QEMU level. We should enforce this constraint.
+			Feature: hyperv.SyNIC,
+			Label:   "synic",
+		},
+		hvFeatureLabel{
+			// TODO: SyNICTimer depends on SyNIC and Relaxed. We should enforce this constraint.
+			Feature: hyperv.SyNICTimer,
+			Label:   "synictimer",
+		},
+		hvFeatureLabel{
+			Feature: hyperv.Frequencies,
+			Label:   "frequencies",
+		},
+		hvFeatureLabel{
+			Feature: hyperv.Reenlightenment,
+			Label:   "reenlightenment",
+		},
+		hvFeatureLabel{
+			Feature: hyperv.TLBFlush,
+			Label:   "tlbflush",
+		},
+		hvFeatureLabel{
+			Feature: hyperv.IPI,
+			Label:   "ipi",
+		},
 	}
-	return false
+}
+
+func getHypervNodeSelectors(vmi *v1.VirtualMachineInstance) map[string]string {
+	nodeSelectors := make(map[string]string)
+	if vmi.Spec.Domain.Features == nil || vmi.Spec.Domain.Features.Hyperv == nil {
+		return nodeSelectors
+	}
+
+	hvFeatureLabels := makeHVFeatureLabelTable(vmi)
+	for _, hv := range hvFeatureLabels {
+		if isFeatureStateEnabled(hv.Feature) {
+			nodeSelectors[NFD_KVM_INFO_PREFIX+hv.Label] = "true"
+		}
+	}
+	return nodeSelectors
 }
 
 func CPUModelLabelFromCPUModel(vmi *v1.VirtualMachineInstance) (label string, err error) {
@@ -632,10 +628,7 @@ func (t *templateService) RenderLaunchManifest(vmi *v1.VirtualMachineInstance) (
 		resources.Limits[k8sv1.ResourceMemory] = *resources.Requests.Memory()
 	}
 
-	lessPVCSpaceToleration, err := GetlessPVCSpaceToleration(t.configMapStore)
-	if err != nil {
-		return nil, err
-	}
+	lessPVCSpaceToleration := t.clusterConfig.GetLessPVCSpaceToleration()
 
 	command := []string{"/usr/bin/virt-launcher",
 		"--qemu-timeout", "5m",
@@ -650,15 +643,8 @@ func (t *templateService) RenderLaunchManifest(vmi *v1.VirtualMachineInstance) (
 		"--less-pvc-space-toleration", strconv.Itoa(lessPVCSpaceToleration),
 	}
 
-	useEmulation, err := IsEmulationAllowed(t.configMapStore)
-	if err != nil {
-		return nil, err
-	}
-
-	imagePullPolicy, err := GetImagePullPolicy(t.configMapStore)
-	if err != nil {
-		return nil, err
-	}
+	useEmulation := t.clusterConfig.IsUseEmulation()
+	imagePullPolicy := t.clusterConfig.GetImagePullPolicy()
 
 	if resources.Limits == nil {
 		resources.Limits = make(k8sv1.ResourceList)
@@ -780,7 +766,7 @@ func (t *templateService) RenderLaunchManifest(vmi *v1.VirtualMachineInstance) (
 		nodeSelector[k] = v
 
 	}
-	if IsCPUNodeDiscoveryEnabled(t.configMapStore) {
+	if t.clusterConfig.CPUNodeDiscoveryEnabled() {
 		if cpuModelLabel, err := CPUModelLabelFromCPUModel(vmi); err == nil {
 			if vmi.Spec.Domain.CPU.Model != v1.CPUModeHostModel && vmi.Spec.Domain.CPU.Model != v1.CPUModeHostPassthrough {
 				nodeSelector[cpuModelLabel] = "true"
@@ -791,11 +777,15 @@ func (t *templateService) RenderLaunchManifest(vmi *v1.VirtualMachineInstance) (
 		}
 	}
 
-	nodeSelector[v1.NodeSchedulable] = "true"
-	nodeSelectors, err := getNodeSelectors(t.configMapStore)
-	if err != nil {
-		return nil, err
+	if t.clusterConfig.HypervStrictCheckEnabled() {
+		hvNodeSelectors := getHypervNodeSelectors(vmi)
+		for k, v := range hvNodeSelectors {
+			nodeSelector[k] = v
+		}
 	}
+
+	nodeSelector[v1.NodeSchedulable] = "true"
+	nodeSelectors := t.clusterConfig.GetNodeSelectors()
 	for k, v := range nodeSelectors {
 		nodeSelector[k] = v
 	}
@@ -817,10 +807,12 @@ func (t *templateService) RenderLaunchManifest(vmi *v1.VirtualMachineInstance) (
 			resources.Limits[k8sv1.ResourceCPU] = resource.MustParse("200m")
 			resources.Limits[k8sv1.ResourceMemory] = resource.MustParse("64M")
 		}
-		containers = append(containers, k8sv1.Container{
+		sidecar := k8sv1.Container{
 			Name:            fmt.Sprintf("hook-sidecar-%d", i),
 			Image:           requestedHookSidecar.Image,
 			ImagePullPolicy: requestedHookSidecar.ImagePullPolicy,
+			Command:         requestedHookSidecar.Command,
+			Args:            requestedHookSidecar.Args,
 			Resources:       resources,
 			VolumeMounts: []k8sv1.VolumeMount{
 				k8sv1.VolumeMount{
@@ -828,7 +820,8 @@ func (t *templateService) RenderLaunchManifest(vmi *v1.VirtualMachineInstance) (
 					MountPath: hooks.HookSocketsSharedDirectory,
 				},
 			},
-		})
+		}
+		containers = append(containers, sidecar)
 	}
 
 	// XXX: reduce test time. Adding one more container delays the start.
@@ -871,6 +864,12 @@ func (t *templateService) RenderLaunchManifest(vmi *v1.VirtualMachineInstance) (
 		annotationsList[k] = v
 	}
 
+	for _, network := range vmi.Spec.Networks {
+		if network.Multus != nil && network.Multus.Default {
+			annotationsList[MULTUS_DEFAULT_NETWORK_CNI_ANNOTATION] = network.Multus.NetworkName
+		}
+	}
+
 	if HaveMasqueradeInterface(vmi.Spec.Domain.Devices.Interfaces) {
 		annotationsList[ISTIO_KUBEVIRT_ANNOTATION] = "k6t-eth0"
 	}
@@ -909,16 +908,11 @@ func (t *templateService) RenderLaunchManifest(vmi *v1.VirtualMachineInstance) (
 		pod.Spec.Affinity = vmi.Spec.Affinity.DeepCopy()
 	}
 
-	if IsCPUNodeDiscoveryEnabled(t.configMapStore) {
+	if t.clusterConfig.CPUNodeDiscoveryEnabled() {
 		SetNodeAffinityForForbiddenFeaturePolicy(vmi, &pod)
 	}
 
-	if vmi.Spec.Tolerations != nil {
-		pod.Spec.Tolerations = []k8sv1.Toleration{}
-		for _, v := range vmi.Spec.Tolerations {
-			pod.Spec.Tolerations = append(pod.Spec.Tolerations, v)
-		}
-	}
+	pod.Spec.Tolerations = vmi.Spec.Tolerations
 
 	if len(serviceAccountName) > 0 {
 		pod.Spec.ServiceAccountName = serviceAccountName
@@ -1080,6 +1074,15 @@ func getNetworkToResourceMap(virtClient kubecli.KubevirtClient, vmi *v1.VirtualM
 	return
 }
 
+func getIfaceByName(vmi *v1.VirtualMachineInstance, name string) *v1.Interface {
+	for _, iface := range vmi.Spec.Domain.Devices.Interfaces {
+		if iface.Name == name {
+			return &iface
+		}
+	}
+	return nil
+}
+
 func getCniAnnotations(vmi *v1.VirtualMachineInstance) (cniAnnotations map[string]string, err error) {
 	ifaceList := make([]string, 0)
 	ifaceListMap := make([]map[string]string, 0)
@@ -1089,11 +1092,23 @@ func getCniAnnotations(vmi *v1.VirtualMachineInstance) (cniAnnotations map[strin
 	for _, network := range vmi.Spec.Networks {
 		// Set the type for the first network. All other networks must have same type.
 		if network.Multus != nil {
+			if network.Multus.Default {
+				continue
+			}
 			namespace, networkName := getNamespaceAndNetworkName(vmi, network.Multus.NetworkName)
 			ifaceMap := map[string]string{
 				"name":      networkName,
 				"namespace": namespace,
 				"interface": fmt.Sprintf("net%d", next_idx+1),
+			}
+			iface := getIfaceByName(vmi, network.Name)
+			if iface != nil && iface.MacAddress != "" {
+				// De-facto Standard doesn't define exact string format for
+				// MAC addresses pasted down to CNI.  Here we just pass through
+				// whatever the value our API layer accepted as legit.
+				// Note: while standard allows for 20-byte InfiniBand addresses,
+				// we forbid them in API.
+				ifaceMap["mac"] = iface.MacAddress
 			}
 			next_idx = next_idx + 1
 			ifaceListMap = append(ifaceListMap, ifaceMap)
@@ -1118,9 +1133,9 @@ func NewTemplateService(launcherImage string,
 	virtShareDir string,
 	ephemeralDiskDir string,
 	imagePullSecret string,
-	configMapCache cache.Store,
 	persistentVolumeClaimCache cache.Store,
-	virtClient kubecli.KubevirtClient) TemplateService {
+	virtClient kubecli.KubevirtClient,
+	clusterConfig *virtconfig.ClusterConfig) TemplateService {
 
 	precond.MustNotBeEmpty(launcherImage)
 	svc := templateService{
@@ -1128,9 +1143,9 @@ func NewTemplateService(launcherImage string,
 		virtShareDir:               virtShareDir,
 		ephemeralDiskDir:           ephemeralDiskDir,
 		imagePullSecret:            imagePullSecret,
-		configMapStore:             configMapCache,
 		persistentVolumeClaimStore: persistentVolumeClaimCache,
 		virtClient:                 virtClient,
+		clusterConfig:              clusterConfig,
 	}
 	return &svc
 }

@@ -72,7 +72,7 @@ var _ = Describe("[rfe_id:899][crit:medium][vendor:cnv-qe@redhat.com][level:comp
 
 				By("Running VMI")
 				vmi := tests.NewRandomVMIWithConfigMap(configMapName)
-				tests.RunVMIAndExpectLaunch(vmi, false, 90)
+				tests.RunVMIAndExpectLaunch(vmi, 90)
 
 				By("Checking if ConfigMap has been attached to the pod")
 				vmiPod := tests.GetRunningPodByVirtualMachineInstance(vmi, tests.NamespaceTestDefault)
@@ -132,7 +132,7 @@ var _ = Describe("[rfe_id:899][crit:medium][vendor:cnv-qe@redhat.com][level:comp
 				tests.AddConfigMapDisk(vmi, configMaps[1])
 				tests.AddConfigMapDisk(vmi, configMaps[2])
 
-				tests.RunVMIAndExpectLaunch(vmi, false, 90)
+				tests.RunVMIAndExpectLaunch(vmi, 90)
 			})
 		})
 	})
@@ -168,7 +168,7 @@ var _ = Describe("[rfe_id:899][crit:medium][vendor:cnv-qe@redhat.com][level:comp
 
 				By("Running VMI")
 				vmi := tests.NewRandomVMIWithSecret(secretName)
-				tests.RunVMIAndExpectLaunch(vmi, false, 90)
+				tests.RunVMIAndExpectLaunch(vmi, 90)
 
 				By("Checking if Secret has been attached to the pod")
 				vmiPod := tests.GetRunningPodByVirtualMachineInstance(vmi, tests.NamespaceTestDefault)
@@ -227,7 +227,7 @@ var _ = Describe("[rfe_id:899][crit:medium][vendor:cnv-qe@redhat.com][level:comp
 				tests.AddSecretDisk(vmi, secrets[1])
 				tests.AddSecretDisk(vmi, secrets[2])
 
-				tests.RunVMIAndExpectLaunch(vmi, false, 90)
+				tests.RunVMIAndExpectLaunch(vmi, 90)
 			})
 		})
 
@@ -240,14 +240,14 @@ var _ = Describe("[rfe_id:899][crit:medium][vendor:cnv-qe@redhat.com][level:comp
 
 		serviceAccountPath := config.ServiceAccountSourceDir
 
-		It("[test_id:998]Should be the fs layout the same for a pod and vmi", func() {
+		It("[test_id:998]Should be the namespace and token the same for a pod and vmi", func() {
 			By("Running VMI")
 			vmi := tests.NewRandomVMIWithServiceAccount("default")
-			tests.RunVMIAndExpectLaunch(vmi, false, 90)
+			tests.RunVMIAndExpectLaunch(vmi, 90)
 
 			By("Checking if ServiceAccount has been attached to the pod")
 			vmiPod := tests.GetRunningPodByVirtualMachineInstance(vmi, tests.NamespaceTestDefault)
-			podOutput, err := tests.ExecuteCommandOnPod(
+			namespace, err := tests.ExecuteCommandOnPod(
 				virtClient,
 				vmiPod,
 				vmiPod.Spec.Containers[0].Name,
@@ -255,8 +255,18 @@ var _ = Describe("[rfe_id:899][crit:medium][vendor:cnv-qe@redhat.com][level:comp
 					serviceAccountPath + "/namespace",
 				},
 			)
+
 			Expect(err).To(BeNil())
-			Expect(podOutput).To(Equal(tests.NamespaceTestDefault))
+			Expect(namespace).To(Equal(tests.NamespaceTestDefault))
+
+			token, err := tests.ExecuteCommandOnPod(
+				virtClient,
+				vmiPod,
+				vmiPod.Spec.Containers[0].Name,
+				[]string{"tail", "-c", "20",
+					serviceAccountPath + "/token",
+				},
+			)
 
 			By("Checking mounted iso image")
 			expecter, err := tests.LoggedInAlpineExpecter(vmi)
@@ -270,6 +280,8 @@ var _ = Describe("[rfe_id:899][crit:medium][vendor:cnv-qe@redhat.com][level:comp
 				&expect.BExp{R: "0"},
 				&expect.BSnd{S: "cat /mnt/namespace\n"},
 				&expect.BExp{R: tests.NamespaceTestDefault},
+				&expect.BSnd{S: "tail -c 20 /mnt/token\n"},
+				&expect.BExp{R: token},
 			}, 200*time.Second)
 			Expect(err).ToNot(HaveOccurred())
 		})

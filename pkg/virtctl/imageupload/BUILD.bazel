@@ -28,11 +28,6 @@ go_test(
         "imageupload_suite_test.go",
         "imageupload_test.go",
     ],
-    args = [
-        "--cirros-image-path",
-        "$(location @cirros_image//file)",
-    ],
-    data = ["@cirros_image//file"],
     embed = [":go_default_library"],
     deps = [
         "//pkg/kubecli:go_default_library",
@@ -47,6 +42,7 @@ go_test(
         "//vendor/k8s.io/apimachinery/pkg/runtime:go_default_library",
         "//vendor/k8s.io/client-go/kubernetes/fake:go_default_library",
         "//vendor/k8s.io/client-go/testing:go_default_library",
+        "//vendor/kubevirt.io/containerized-data-importer/pkg/apis/core/v1alpha1:go_default_library",
         "//vendor/kubevirt.io/containerized-data-importer/pkg/client/clientset/versioned/fake:go_default_library",
     ],
 )

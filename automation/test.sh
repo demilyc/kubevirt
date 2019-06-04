@@ -29,8 +29,9 @@
 set -ex
 
 export WORKSPACE="${WORKSPACE:-$PWD}"
-readonly ARTIFACTS_PATH="$WORKSPACE/exported-artifacts"
+readonly ARTIFACTS_PATH="${ARTIFACTS-$WORKSPACE/exported-artifacts}"
 readonly TEMPLATES_SERVER="https://templates.ovirt.org/kubevirt/"
+readonly BAZEL_CACHE="${BAZEL_CACHE:-http://bazel-cache.kubevirt-prow.svc.cluster.local:8080/kubevirt.io/kubevirt}"
 
 if [[ $TARGET =~ windows.* ]]; then
   export KUBEVIRT_PROVIDER="k8s-1.11.0"
@@ -114,7 +115,7 @@ safe_download() (
     fi
 )
 
-if [[ $TARGET =~ os-.* ]]; then
+if [[ $TARGET =~ os-.* ]] || [[ $TARGET =~ okd-.* ]]; then
     # Create images directory
     if [[ ! -d $RHEL_NFS_DIR ]]; then
         mkdir -p $RHEL_NFS_DIR
@@ -140,24 +141,14 @@ fi
 
 kubectl() { cluster/kubectl.sh "$@"; }
 
-
-# If run on CI use random kubevirt system-namespaces
-if [ -n "${JOB_NAME}" ]; then
-  export NAMESPACE="kubevirt-system-$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 10 | head -n 1)"
-  cat >hack/config-local.sh <<EOF
-namespace=${NAMESPACE}
-EOF
-else
-  export NAMESPACE="${NAMESPACE:-kubevirt}"
-fi
-
+export NAMESPACE="${NAMESPACE:-kubevirt}"
 
 # Make sure that the VM is properly shut down on exit
 trap '{ make cluster-down; }' EXIT SIGINT SIGTERM SIGSTOP
 
 
 # Check if we are on a pull request in jenkins.
-export KUBEVIRT_CACHE_FROM=${ghprbTargetBranch}
+export KUBEVIRT_CACHE_FROM=${PULL_BASE_REF}
 if [ -n "${KUBEVIRT_CACHE_FROM}" ]; then
     make pull-cache
 fi
@@ -168,7 +159,7 @@ make cluster-down
 cat >.bazelrc <<EOF
 startup --host_jvm_args=-Dbazel.DigestFunction=sha256
 build --remote_local_fallback
-build --remote_http_cache=http://bazel-cache.kubevirt-prow.svc.cluster.local:8080/kubevirt.io/kubevirt
+build --remote_http_cache=${BAZEL_CACHE}
 EOF
 
 # build all images with the basic repeat logic
@@ -200,7 +191,14 @@ set -e
 echo "Nodes are ready:"
 kubectl get nodes
 
-make cluster-sync
+make cluster-build
+
+# I do not have good indication that OKD API server ready to serve requests, so I will just
+# repeat cluster-deploy until it succeeds
+until make cluster-deploy; do
+    sleep 1
+done
+
 hack/dockerized bazel shutdown
 
 # OpenShift is running important containers under default namespace
@@ -245,7 +243,7 @@ kubectl version
 
 mkdir -p "$ARTIFACTS_PATH"
 
-ginko_params="--ginkgo.noColor --junit-output=$ARTIFACTS_PATH/tests.junit.xml"
+ginko_params="--ginkgo.noColor --junit-output=$ARTIFACTS_PATH/junit.functest.xml"
 
 # Prepare PV for Windows testing
 if [[ $TARGET =~ windows.* ]]; then

@@ -49,7 +49,7 @@ EOF
 # Deploy kubevirt operator
 _kubectl apply -f ${MANIFESTS_OUT_DIR}/release/kubevirt-operator.yaml
 
-if [[ "$KUBEVIRT_PROVIDER" =~ os-* ]]; then
+if [[ "$KUBEVIRT_PROVIDER" =~ os-* ]] || [[ "$KUBEVIRT_PROVIDER" =~ okd-* ]]; then
     _kubectl create -f ${MANIFESTS_OUT_DIR}/testing/ocp
 
     _kubectl adm policy add-scc-to-user privileged -z kubevirt-operator -n ${namespace}
@@ -78,24 +78,6 @@ until _kubectl -n kubevirt get kv kubevirt; do
 done
 
 # wait until KubeVirt is ready
-if [[ "$KUBEVIRT_PROVIDER" =~ .*.10..* ]]; then
-    # k8s version 1.10.* does not have wait command
-    # TODO: drop it once we get rid of 1.10.* provider
-    timeout=180
-    sample=30
-    current_time=0
-    while [ -n "$(_kubectl -n kubevirt get kv kubevirt -o'custom-columns=status:status.conditions[*].type' --no-headers | grep -v Ready)" ]; do
-        echo "Waiting for kubevirt operator to have the Ready condition ..."
-        _kubectl -n kubevirt get kv kubevirt -o'custom-columns=status:status.conditions[*].type' --no-headers | grep >&2 -v Ready || true
-        sleep $sample
-
-        current_time=$((current_time + sample))
-        if [ $current_time -gt $timeout ]; then
-            exit 1
-        fi
-    done
-else
-    _kubectl wait -n kubevirt kv kubevirt --for condition=Ready --timeout 180s || (echo "KubeVirt not ready in time" && exit 1)
-fi
+_kubectl wait -n kubevirt kv kubevirt --for condition=Ready --timeout 180s || (echo "KubeVirt not ready in time" && exit 1)
 
 echo "Done"
